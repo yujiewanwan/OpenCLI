@@ -609,7 +609,18 @@ async function waitForChatGPTUploadPreview(page, fileNames) {
                 const scope = root || document.body;
                 if (!scope) return false;
 
-                const previewNodes = scope.querySelectorAll('img[src], canvas, video, [style*="background-image"], [data-testid*="attachment"], [data-testid*="upload"], [class*="attachment"], [class*="upload"]');
+                const isVisibleMedia = (node) => {
+                    if (!(node instanceof HTMLElement)) return false;
+                    const style = window.getComputedStyle(node);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    const rect = node.getBoundingClientRect();
+                    const width = node.naturalWidth || node.videoWidth || rect.width || 0;
+                    const height = node.naturalHeight || node.videoHeight || rect.height || 0;
+                    if (width > 32 && height > 32) return true;
+                    const backgroundImage = style.backgroundImage || '';
+                    return /url\\(/.test(backgroundImage) && rect.width > 32 && rect.height > 32;
+                };
+                const previewNodes = Array.from(scope.querySelectorAll('img[src], canvas, video, [style*="background-image"]')).filter(isVisibleMedia);
                 return previewNodes.length >= names.length;
             })()
         `)), 'chatgpt upload preview detection');
@@ -746,6 +757,17 @@ export async function getChatGPTVisibleImageUrls(page) {
                 const text = [alt, cls, testId, label, src.toLowerCase()].join(' ');
                 return /avatar|profile|logo|icon/.test(text);
             };
+            const isUserUploadPreview = (img) => {
+                const alt = (img.getAttribute('alt') || '').toLowerCase();
+                const turn = img.closest('section[data-testid^="conversation-turn"]');
+                const heading = (turn?.querySelector('h4')?.innerText || '').toLowerCase();
+                if (/you said|你说/.test(heading)) return true;
+                if (/chatgpt|assistant|助手/.test(heading)) return false;
+                const openButtonLabel = (img.closest('button[aria-label^="Open image:"]')?.getAttribute('aria-label') || '').toLowerCase();
+                const previewText = [alt, openButtonLabel].join(' ');
+                return /\.(png|jpe?g|webp|gif|heic|heif)(?:\b|$)/i.test(previewText)
+                    || /ref-|reference|参考|upload|uploaded|attachment/.test(previewText);
+            };
 
             const imgs = Array.from(document.querySelectorAll('img')).filter(img =>
                 img instanceof HTMLImageElement && isVisible(img)
@@ -758,6 +780,7 @@ export async function getChatGPTVisibleImageUrls(page) {
 
                 if (!src) continue;
                 if (isDecorative(img, src)) continue;
+                if (isUserUploadPreview(img)) continue;
                 if (width < 128 && height < 128) continue;
                 addUrl(src);
             }
@@ -777,16 +800,41 @@ export async function getChatGPTVisibleImageUrls(page) {
                 }
             }
 
-            // Some image experiences render to a canvas. Returning the data URL
-            // lets the downstream asset exporter save it without needing a DOM
-            // selector to rediscover the canvas.
+            // Some ChatGPT image surfaces mount large transparent canvases as
+            // placeholders/overlays before the real backend image is ready. If
+            // those data URLs are accepted as generated assets, the adapter can
+            // save a blank transparent PNG while reporting success. Prefer real
+            // <img>/background URLs; only keep a canvas if it contains at least
+            // one non-transparent/non-white sampled pixel.
             for (const canvas of Array.from(document.querySelectorAll('canvas'))) {
                 if (!(canvas instanceof HTMLCanvasElement) || !isVisible(canvas) || isDecorative(canvas)) continue;
                 const width = canvas.width || canvas.getBoundingClientRect().width || 0;
                 const height = canvas.height || canvas.getBoundingClientRect().height || 0;
                 if (width < 128 && height < 128) continue;
                 try {
-                    addUrl(canvas.toDataURL('image/png'));
+                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                    if (!ctx) continue;
+                    const sourceWidth = Math.max(1, Math.floor(canvas.width || width));
+                    const sourceHeight = Math.max(1, Math.floor(canvas.height || height));
+                    const xCount = Math.min(sourceWidth, 16);
+                    const yCount = Math.min(sourceHeight, 16);
+                    let hasContent = false;
+                    for (let yi = 0; yi < yCount && !hasContent; yi += 1) {
+                        const y = Math.min(sourceHeight - 1, Math.floor((yi + 0.5) * sourceHeight / yCount));
+                        for (let xi = 0; xi < xCount && !hasContent; xi += 1) {
+                            const x = Math.min(sourceWidth - 1, Math.floor((xi + 0.5) * sourceWidth / xCount));
+                            const pixel = ctx.getImageData(x, y, 1, 1).data;
+                            const r = pixel[0];
+                            const g = pixel[1];
+                            const b = pixel[2];
+                            const a = pixel[3];
+                            if (a > 0 && !(r > 248 && g > 248 && b > 248)) {
+                                hasContent = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (hasContent) addUrl(canvas.toDataURL('image/png'));
                 } catch { }
             }
             return urls;
